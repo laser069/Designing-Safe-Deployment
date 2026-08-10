@@ -20,8 +20,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  logger.info(`Orion API started on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    logger.info(`Orion API started on port ${PORT}`);
+  });
+}
 
 module.exports = app;
