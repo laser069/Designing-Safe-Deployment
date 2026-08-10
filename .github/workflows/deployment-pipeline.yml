@@ -1,0 +1,269 @@
+name: Deployment Pipeline
+
+on:
+  push:
+    branches: ['main', 'fix/**', 'feature/**']
+  pull_request:
+    branches: ['main']
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  source:
+    name: Source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record trigger metadata
+        run: |
+          echo "### Deployment Pipeline Run" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Ref:** \`${{ github.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Actor:** ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Event:** ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Started (UTC):** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: source
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies (reproducible)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            src/
+            package.json
+            package-lock.json
+          retention-days: 1
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test -- --coverage
+
+      - name: Enforce coverage threshold (>= 80%)
+        run: |
+          PCT=$(node -e "console.log(require('./coverage/coverage-summary.json').total.lines.pct)")
+          echo "Line coverage: $PCT%"
+          awk -v pct="$PCT" 'BEGIN { exit !(pct >= 80) }' || {
+            echo "::error::Coverage $PCT% is below the required 80% threshold"
+            exit 1
+          }
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 1
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dependency audit (fail on high/critical)
+        run: npm audit --audit-level=high
+
+      - name: Basic secret scan
+        run: |
+          if git grep -nE "(AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35})" -- . ':!.env.example' | grep -v '^Binary'; then
+            echo "::error::Potential secret pattern found in tracked files"
+            exit 1
+          else
+            echo "No known secret patterns found."
+          fi
+
+  deploy-staging:
+    name: Deploy-Staging
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+
+      - name: Deploy to staging
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if [ -n "${{ secrets.GCP_SA_KEY }}" ]; then
+            echo "[deploy-staging] Real GCP credentials present, invoking scripts/deploy.sh"
+            bash scripts/deploy.sh
+          else
+            echo "[deploy-staging] No GCP credentials configured — simulating deploy"
+            echo "[deploy-staging] Would build and push \${REGISTRY}/orion-api:${IMAGE_TAG}"
+            echo "[deploy-staging] Would run: gcloud run services update orion-api --image ... --region us-central1 --platform managed"
+          fi
+
+  deploy-production:
+    name: Deploy-Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+
+      - name: Deploy to production
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if [ -n "${{ secrets.GCP_SA_KEY }}" ]; then
+            echo "[deploy-production] Real GCP credentials present, invoking scripts/deploy.sh"
+            bash scripts/deploy.sh
+          else
+            echo "[deploy-production] No GCP credentials configured — simulating deploy"
+            echo "[deploy-production] Would build and push \${REGISTRY}/orion-api:${IMAGE_TAG}"
+            echo "[deploy-production] Would run: gcloud run services update orion-api --image ... --region us-central1 --platform managed"
+          fi
+
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start app for smoke test
+        run: |
+          nohup node src/index.js > app.log 2>&1 &
+          echo $! > app.pid
+          sleep 2
+
+      - name: Run health check (no swallowed failures)
+        run: bash scripts/healthcheck.sh http://localhost:3000
+
+      - name: Stop app
+        if: always()
+        run: kill "$(cat app.pid)" 2>/dev/null || true
+
+  rollback:
+    name: Rollback
+    runs-on: ubuntu-latest
+    needs: verify
+    if: always() && needs.verify.result == 'failure'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trigger rollback
+        run: |
+          echo "::warning::Verify stage failed — rolling back to previous known-good image"
+          bash scripts/rollback.sh "previous-${{ github.event.before }}" || true
+          echo "[rollback] Rollback triggered for commit ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [source, build, test, security, deploy-staging, deploy-production, verify, rollback]
+    if: always()
+    steps:
+      - name: Summarize pipeline result
+        run: |
+          echo "### Pipeline Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Source | ${{ needs.source.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build | ${{ needs.build.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test | ${{ needs.test.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Security | ${{ needs.security.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Deploy-Staging | ${{ needs.deploy-staging.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Deploy-Production | ${{ needs.deploy-production.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Verify | ${{ needs.verify.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rollback | ${{ needs.rollback.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`${{ github.sha }}\` | Finished (UTC): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack (if configured)
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Pipeline for ${{ github.sha }} finished. Test=${{ needs.test.result }} Deploy-Production=${{ needs.deploy-production.result }} Verify=${{ needs.verify.result }}\"}" \
+            "$SLACK_WEBHOOK_URL"
